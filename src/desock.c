@@ -20,10 +20,12 @@
 #define READ_BUF_SIZE 65536
 
 #define PREENY_SOCKET(x) (x+PREENY_SOCKET_OFFSET)
+#define PREENY_UNSOCKET(x) (x-PREENY_SOCKET_OFFSET)
 
 int preeny_desock_shutdown_flag = 0;
 pthread_t *preeny_socket_threads_to_front[PREENY_MAX_FD] = { 0 };
 pthread_t *preeny_socket_threads_to_back[PREENY_MAX_FD] = { 0 };
+int preeny_socket_acceptfd[PREENY_MAX_FD] = { 0 };
 
 int preeny_socket_sync(int from, int to, int timeout)
 {
@@ -56,8 +58,23 @@ int preeny_socket_sync(int from, int to, int timeout)
 	}
 	else if (total_n == 0 && from == 0)
 	{
-		preeny_info("synchronization of fd %d to %d shutting down due to EOF\n");
-		return -1;
+          preeny_info("synchronization of fd %d to %d shutting down due to EOF\n", from, to);
+          int ret;
+
+          shutdown(to, SHUT_WR);
+
+          while (ret = recv(PREENY_UNSOCKET(to), &ret, 0, MSG_PEEK|MSG_DONTWAIT) != -1) {
+            preeny_debug("recv(to) returns %d\n", ret);
+          }
+          //preeny_debug("ERROR %s\n", strerror(errno));
+          if (errno = EBADF) {
+            preeny_debug("DONE!\n");
+            exit(0);
+          } else {
+            perror("Unexpected preeny error:");
+            exit(1);
+          }
+          return -1;
 	}
 	preeny_debug("read %d bytes from %d (will write to %d)\n", total_n, from, to);
 
@@ -166,8 +183,9 @@ __attribute__((constructor)) void preeny_desock_orig()
 
 int socket(int domain, int type, int protocol)
 {
-	int fds[2];
-	int front_socket;
+        int acceptfds[2]; // These fds are returned by accept
+        int socketfds[2]; // These are returned by socket
+        int front_socket;
 	int back_socket;
 
 	if (domain != AF_INET && domain != AF_INET6)
@@ -175,47 +193,56 @@ int socket(int domain, int type, int protocol)
 		preeny_info("Ignoring non-internet socket.");
 		return original_socket(domain, type, protocol);
 	}
-	
-	int r = socketpair(AF_UNIX, type, 0, fds);
+
 	preeny_debug("Intercepted socket()!\n");
 
-	if (r != 0)
-	{
-		perror("preeny socket emulation failed:");
-		return -1;
-	}
+        int r = socketpair(AF_UNIX, type, 0, acceptfds);
+        if (r != 0) {
+          perror("preeny socket emulation failed:");
+          return -1;
+        }
 
-	preeny_debug("... created socket pair (%d, %d)\n", fds[0], fds[1]);
+        r = socketpair(AF_UNIX, type, 0, socketfds);
+        // Write to socket fds to make it look like we have a new connection
+        if (r != 0 || send(socketfds[1], socketfds, 1, 0) != 1) {
+          perror("preeny socket emulation failed:");
+          return -1;
+        }
 
-	front_socket = fds[0];
-	back_socket = dup2(fds[1], PREENY_SOCKET(front_socket));
-	close(fds[1]);
+	preeny_debug("... created socket pair (%d, %d)\n", socketfds[0], socketfds[1]);
 
-	preeny_debug("... dup into socketpair (%d, %d)\n", fds[0], back_socket);
+	front_socket = acceptfds[0];
+	back_socket = dup2(acceptfds[1], PREENY_SOCKET(front_socket));
+	close(acceptfds[1]);
 
-	preeny_socket_threads_to_front[fds[0]] = malloc(sizeof(pthread_t));
-	preeny_socket_threads_to_back[fds[0]] = malloc(sizeof(pthread_t));
+	preeny_debug("... dup into socketpair (%d, %d)\n", front_socket, back_socket);
 
-	r = pthread_create(preeny_socket_threads_to_front[fds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_front, (void *)front_socket);
+	preeny_socket_threads_to_front[socketfds[0]] = malloc(sizeof(pthread_t));
+	preeny_socket_threads_to_back[socketfds[0]] = malloc(sizeof(pthread_t));
+
+        preeny_socket_acceptfd[socketfds[0]] = acceptfds[0];
+
+	r = pthread_create(preeny_socket_threads_to_front[socketfds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_front, (void *)front_socket);
 	if (r)
 	{
 		perror("failed creating front-sync thread");
 		return -1;
 	}
 
-	r = pthread_create(preeny_socket_threads_to_back[fds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_back, (void *)front_socket);
+	r = pthread_create(preeny_socket_threads_to_back[socketfds[0]], NULL, (void*(*)(void*))preeny_socket_sync_to_back, (void *)front_socket);
 	if (r)
 	{
 		perror("failed creating back-sync thread");
 		return -1;
 	}
 
-	return fds[0];
+	return socketfds[0];
 }
 
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 {
-	//initialize a sockaddr_in for the peer
+         static int first = 1;
+         //initialize a sockaddr_in for the peer
 	 struct sockaddr_in peer_addr;
 	 memset(&peer_addr, '0', sizeof(struct sockaddr_in));
 
@@ -229,7 +256,17 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 	//copy the initialized peer_addr back to the original sockaddr. Note the space for the original sockaddr, namely addr, has already been allocated
 	if (addr) memcpy(addr, &peer_addr, sizeof(struct sockaddr_in));
 
-	if (preeny_socket_threads_to_front[sockfd]) return dup(sockfd);
+	if (preeny_socket_threads_to_front[sockfd]) {
+          if (first) {
+            int dupfd = preeny_socket_acceptfd[sockfd];
+            preeny_debug("accept returning fd %d\n", dupfd);
+            first = 0;
+            return dupfd;
+          } else {
+            preeny_debug("accept is called again\n");
+            return -1;
+          }
+        }
 	else return original_accept(sockfd, addr, addrlen);
 }
 
