@@ -68,7 +68,7 @@ int preeny_socket_sync(int from, int to, int timeout)
           }
           //preeny_debug("ERROR %s\n", strerror(errno));
           if (errno = EBADF) {
-            preeny_debug("DONE!\n");
+            preeny_debug("Remote side of %d has been shutdown\n", PREENY_UNSOCKET(to));
             exit(0);
           } else {
             perror("Unexpected preeny error:");
@@ -203,11 +203,20 @@ int socket(int domain, int type, int protocol)
         }
 
         r = socketpair(AF_UNIX, type, 0, socketfds);
-        // Write to socket fds to make it look like we have a new connection
-        if (r != 0 || send(socketfds[1], socketfds, 1, 0) != 1) {
+        if (r != 0) {
           perror("preeny socket emulation failed:");
           return -1;
         }
+
+        // Write to socket fds to make it look like we have a new connection
+	static int first = 1;
+	if (first) {
+	  if (send(socketfds[1], socketfds, 1, 0) != 1) {
+	    perror("preeny socket emulation failed:");
+	    return -1;
+	  }
+	  first = 0;
+	}
 
 	preeny_debug("... created socket pair (%d, %d)\n", socketfds[0], socketfds[1]);
 
@@ -264,6 +273,7 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
             return dupfd;
           } else {
             preeny_debug("accept is called again\n");
+	    errno = EWOULDBLOCK;
             return -1;
           }
         }
