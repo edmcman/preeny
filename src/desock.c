@@ -171,6 +171,7 @@ int (*original_accept)(int, struct sockaddr *, socklen_t *);
 int (*original_connect)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int (*original_setsockopt)(int sockfd, int level, int optname,
                            const void *optval, socklen_t optlen);
+int (*original_fcntl)(int fd, int cmd, ...);
 __attribute__((constructor)) void preeny_desock_orig()
 {
 	original_socket = dlsym(RTLD_NEXT, "socket");
@@ -179,6 +180,7 @@ __attribute__((constructor)) void preeny_desock_orig()
 	original_bind = dlsym(RTLD_NEXT, "bind");
 	original_connect = dlsym(RTLD_NEXT, "connect");
         original_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+	original_fcntl = dlsym(RTLD_NEXT, "fcntl");
 }
 
 int socket(int domain, int type, int protocol)
@@ -190,8 +192,8 @@ int socket(int domain, int type, int protocol)
 
 	if (domain != AF_INET && domain != AF_INET6)
 	{
-		preeny_info("Ignoring non-internet socket.");
-		return original_socket(domain, type, protocol);
+	  preeny_info("Ignoring non-internet socket: %d\n", domain);
+	  return original_socket(domain, type, protocol);
 	}
 
 	preeny_debug("Intercepted socket()!\n");
@@ -315,4 +317,22 @@ int setsockopt(int sockfd, int level, int optname,
 {
   if (preeny_socket_threads_to_front[sockfd]) return 0;
   else return original_setsockopt(sockfd, level, optname, optval, optlen);
+}
+
+int fcntl(int fd, int cmd, int arg)
+{
+  if (preeny_socket_threads_to_front[fd]) {
+    if (cmd == 0 /*F_DUPFD*/) {
+      int newfd = original_fcntl(fd, cmd, arg);
+      if (newfd < 0) {
+	perror("fcntl failed:");
+	return newfd;
+      }
+      preeny_debug("Dup'ing %d to %d\n", fd, newfd);
+      preeny_socket_threads_to_front[newfd] = preeny_socket_threads_to_front[fd];
+      preeny_socket_threads_to_back[newfd] = preeny_socket_threads_to_back[fd];
+      preeny_socket_acceptfd[newfd] = preeny_socket_acceptfd[fd];
+      return newfd;
+    }
+  } else return original_fcntl(fd, cmd, arg);
 }
